@@ -220,6 +220,9 @@
     if (code === 'KUAICHA_NOT_FOUND') {
       return '快查未收录该主体：请核对工商登记全称（可用统一社会信用代码），或改用「批量清单」上传材料。';
     }
+    if (code === 'KUAICHA_AMBIGUOUS') {
+      return '名称匹配到多家主体：请把工商登记全称填完整（例如带上"杭州"、"(集团)"这类字样），或直接填统一社会信用代码。';
+    }
     if (code === 'KUAICHA_AUTH') {
       return '快查鉴权失败：请在服务端核对 KUAICHA_API_KEY 是否为「MCP Key」，以及 KUAICHA_AUTH_HEADER。';
     }

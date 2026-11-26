@@ -196,9 +196,37 @@
     if (!res.ok || !j.ok) {
       const err = new Error(j.message || '检索公开信息失败（HTTP ' + res.status + '）');
       err.code = j.error || 'FACTS_FAILED';
+      err.detail = j.detail || '';
       throw err;
     }
     return j;
+  }
+
+  /**
+   * 把错误码翻译成下一步动作。
+   * 报告与话术两条路径共用，避免出现"报告里提示了、话术里没提示"。
+   */
+  function adviceFor(err) {
+    const code = err && err.code;
+    if (code === 'SEARCH_NO_SOURCE' || code === 'SEARCH_EMPTY') {
+      return '未获取到可引用的公开信息：请核对全称是否与工商登记一致，或改用「批量清单」上传该企业的材料。';
+    }
+    if (code === 'SEARCH_UNSUPPORTED') {
+      return '当前 KIMI 入口不支持联网检索，且快查不可用：请在服务端配置 KUAICHA_API_KEY，或改用「批量清单」上传材料。';
+    }
+    if (code === 'KUAICHA_NOT_FOUND') {
+      return '快查未收录该主体：请核对工商登记全称（可用统一社会信用代码），或改用「批量清单」上传材料。';
+    }
+    if (code === 'KUAICHA_AUTH') {
+      return '快查鉴权失败：请在服务端核对 KUAICHA_API_KEY 是否为「MCP Key」，以及 KUAICHA_AUTH_HEADER。';
+    }
+    if (code === 'KUAICHA_UPSTREAM' || code === 'KUAICHA_BAD_RESPONSE') {
+      return '快查接口异常：多半是 Key 类型不对或额度为空，请到 open.kuaicha365.com 用户中心确认；也可改用「批量清单」上传材料。';
+    }
+    if (code === 'NO_API_KEY') {
+      return '服务端未配置数据源（KUAICHA_API_KEY 或 KIMI_API_KEY），无法采集企业信息与生成内容。';
+    }
+    return '';
   }
 
   /**
@@ -793,20 +821,12 @@
        * 把"杭州明远智能装备"的股东、人数、产品当成真实客户的资料交付，
        * 比交不出报告危险得多——客户经理会照着这份东西去见客户。
        */
-      const advice =
-        err.code === 'SEARCH_NO_SOURCE' || err.code === 'SEARCH_EMPTY'
-          ? '未获取到可引用的公开信息：请核对全称是否与工商登记一致，或改用「批量清单」上传该企业的材料。'
-          : err.code === 'KUAICHA_NOT_FOUND'
-            ? '快查未收录该主体：请核对工商登记全称（可用统一社会信用代码），或改用「批量清单」上传材料。'
-            : err.code === 'KUAICHA_AUTH'
-              ? '快查鉴权失败：请在服务端核对 KUAICHA_API_KEY 与 KUAICHA_AUTH_HEADER。'
-              : err.code === 'NO_API_KEY'
-                ? '服务端未配置数据源（KUAICHA_API_KEY 或 KIMI_API_KEY），无法采集企业信息与生成内容。'
-                : '';
+      const advice = adviceFor(err);
       setPipe(1, '✗ 已中止', 'active');
       if (dv) dv.classList.remove('show');
       if (typeof resetReport === 'function') resetReport();
       toastSafe('生成失败：' + err.message + (advice ? '｜' + advice : ''));
+      if (err.detail) console.warn('[fxhy] 上游原文：', err.detail);
     } finally {
       STATE.busy = false;
       if (btn) btn.disabled = false;
@@ -986,10 +1006,7 @@
       console.error('[fxhy] script failed', err);
       STATE.lastError = err.message;
       /* 与报告一致：失败就如实报错，不把样例话术当成该客户的产出 */
-      const advice =
-        err.code === 'SEARCH_NO_SOURCE' || err.code === 'SEARCH_EMPTY'
-          ? '未检索到可引用的公开信息，请核对全称或用「批量清单」上传该企业材料。'
-          : '';
+      const advice = adviceFor(err);
       if (area) {
         area.innerHTML =
           '<div class="script-card"><div class="script-body">' +
@@ -999,6 +1016,7 @@
           '</div></div>';
       }
       toastSafe('生成失败：' + err.message + (advice ? '｜' + advice : ''));
+      if (err.detail) console.warn('[fxhy] 上游原文：', err.detail);
     } finally {
       STATE.busy = false;
     }

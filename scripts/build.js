@@ -104,9 +104,20 @@ function main() {
     process.exit(1);
   }
 
+  /*
+   * 带内容指纹：线上多次改 live.js 时，浏览器与 CDN 容易继续用旧副本，
+   * 表现成"改了没生效"。文件名后缀随内容变，旧缓存自然失效。
+   * 指纹只加在 query 上，不影响 live.js 自身按 src 目录推导接口前缀。
+   */
+  const liveHash = require('crypto')
+    .createHash('md5')
+    .update(fs.readFileSync(LIVE))
+    .digest('hex')
+    .slice(0, 8);
+
   const inject =
     '\n<!-- fxhy-live -->\n' +
-    '<script src="live.js" defer></script>\n' +
+    '<script src="live.js?v=' + liveHash + '" defer></script>\n' +
     '<!-- /fxhy-live -->\n';
 
   // live.js 必须晚于页面自身脚本执行；defer 保证按文档顺序在解析后执行
@@ -120,7 +131,7 @@ function main() {
   console.log('  输出    ' + rel(OUT));
   console.log('  体积    ' + (originalSize / 1024 / 1024).toFixed(2) + ' MB → ' +
     (Buffer.byteLength(html) / 1024 / 1024).toFixed(2) + ' MB');
-  console.log('  注入    <script src="live.js" defer>');
+  console.log('  注入    <script src="live.js?v=' + liveHash + '" defer>');
 }
 
 main();

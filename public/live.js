@@ -12,6 +12,35 @@
 (function () {
   'use strict';
 
+  /* ---------------------------------------------------------------- 接口前缀
+   * 本站可能挂在子路径上（如 https://www.chyunfan.cn/salesprep/）。
+   * 若把接口写成 "/api/health"，浏览器会解析到域名根，被同域其他应用接管，
+   * 拿回一段 HTML → res.json() 抛错 → 页面误判"未检测到本地服务"退回样例。
+   * 因此按 live.js 自身所在目录推导前缀：本地跑 server.js 时自然得到 "/"。
+   * ---------------------------------------------------------------- */
+  const API_BASE = (function () {
+    function dirOf(pn) {
+      if (/\/$/.test(pn)) return pn;
+      if (/\.[a-z0-9]+$/i.test(pn)) return pn.replace(/[^/]*$/, '');
+      return pn + '/'; // /salesprep 这种无尾斜杠的目录地址
+    }
+    try {
+      const s = document.currentScript || document.querySelector('script[src$="live.js"]');
+      if (s && s.src) {
+        const pn = new URL(s.src, location.href).pathname;
+        const d = dirOf(pn);
+        // 脚本推出根目录、但页面本身在子路径上，说明这个 src 不可信，改用页面地址兜底
+        if (d !== '/' || location.pathname === '/') return d;
+      }
+    } catch (_) {}
+    return dirOf(location.pathname);
+  })();
+
+  /** 把 /api/xxx 拼成当前部署目录下的真实地址 */
+  function api(path) {
+    return API_BASE + String(path).replace(/^\/+/, '');
+  }
+
   /* ------------------------------------------------------------------
    * 先抓住页面原有的函数引用，再做任何覆盖。
    * 顺序错了会把自己当成"原始实现"，降级时无限递归——这个坑踩过一次。
@@ -121,7 +150,7 @@
    * @param {object} hooks {onMeta,onDelta,onRetry,onResult,onError}
    */
   async function callStream(body, hooks) {
-    const res = await fetch('/api/llm', {
+    const res = await fetch(api('/api/llm'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(Object.assign({ stream: true }, body))
@@ -182,7 +211,7 @@
    * 这是"真实企业出真实报告"的唯一入口——采集失败就抛错，不拿样例顶上。
    */
   async function fetchFacts(company) {
-    const res = await fetch('/api/facts', {
+    const res = await fetch(api('/api/facts'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ company })
@@ -216,6 +245,10 @@
     }
     if (code === 'SEARCH_BLOCKED') {
       return '检索请求被上游内容安全策略拦截：请稍后重试，或改用「批量清单」上传该企业材料。';
+    }
+    if (code === 'KUAICHA_IP_DENIED') {
+      return '快查服务端拒绝了本网站出口 IP（网关返回"IP非法"）：需要在快查后台把服务器出口 IP 加入白名单。' +
+        '打开 ' + api('/api/health') + '?probe=1 可以看到 egressIp。在此之前无法自动采集，请改用「批量清单」上传企业材料。';
     }
     if (code === 'KUAICHA_NOT_FOUND') {
       return '快查未收录该主体：请核对工商登记全称（可用统一社会信用代码），或改用「批量清单」上传材料。';
@@ -1354,7 +1387,7 @@ code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;fo
 
     try {
       const b64 = await readAsBase64(file);
-      const res = await fetch('/api/parse', {
+      const res = await fetch(api('/api/parse'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename: name, base64: b64 })
@@ -1498,7 +1531,7 @@ code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;fo
         }));
 
         let stop = null;
-        await postSse('/api/batch', { task: 'report', rows: payload }, (ev, p) => {
+        await postSse(api('/api/batch'), { task: 'report', rows: payload }, (ev, p) => {
           if (ev === 'item') {
             const realIdx = group[p.index];
             if (realIdx === undefined) return;
@@ -1726,7 +1759,12 @@ code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;fo
 
     /* 探活 */
     try {
-      const r = await fetch('/api/health', { cache: 'no-store' });
+      const r = await fetch(api('/api/health'), { cache: 'no-store' });
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('json')) {
+        // 拿到 HTML 说明这个地址被同域其他应用接管了，前后端路径前缀对不上
+        throw new Error('探活地址返回非 JSON（HTTP ' + r.status + '，' + ct + '）：' + api('/api/health') + ' 未指向本应用后端');
+      }
       const j = await r.json();
       STATE.ready = Boolean(j.live);
       STATE.model = j.model || null;
@@ -1739,7 +1777,7 @@ code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;fo
     } catch (e) {
       STATE.ready = false;
       STATE.mode = 'demo';
-      STATE.lastError = '未检测到本地服务（/api/health 不可达），当前为演示样例模式';
+      STATE.lastError = '后端未就绪：' + (e.message || '探测 ' + api('/api/health') + ' 失败');
       STATE.facts = SAMPLE_FACTS;
       STATE.factsName = '内置脱敏样例';
     }
@@ -1750,7 +1788,7 @@ code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;fo
     if (!STATE.ready) {
       console.warn('[fxhy]', STATE.lastError);
       setTimeout(() => {
-        toastSafe('演示模式：未配置 KIMI_API_KEY，页面使用内置样例。配置后刷新即可实时生成');
+        toastSafe('当前为演示样例模式：' + (STATE.lastError || '后端未就绪') + '。详见控制台。');
       }, 900);
     }
   }

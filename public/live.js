@@ -214,6 +214,9 @@
     if (code === 'SEARCH_UNSUPPORTED') {
       return '当前 KIMI 入口不支持联网检索，且快查不可用：请在服务端配置 KUAICHA_API_KEY，或改用「批量清单」上传材料。';
     }
+    if (code === 'SEARCH_BLOCKED') {
+      return '检索请求被上游内容安全策略拦截：请稍后重试，或改用「批量清单」上传该企业材料。';
+    }
     if (code === 'KUAICHA_NOT_FOUND') {
       return '快查未收录该主体：请核对工商登记全称（可用统一社会信用代码），或改用「批量清单」上传材料。';
     }

@@ -6,6 +6,9 @@
  * 原页面一行不改（参赛交付物要保持单文件可离线），
  * 只在其 </body> 前挂一个 live.js —— 页面内所有入口保持不变，
  * 由 live.js 在运行时覆盖为真实调用。
+ *
+ * 云端（Vercel）构建时只认 data/demo-source.html：
+ * 那是随工程提交的副本，不能依赖本机的参赛作品目录。
  */
 
 const fs = require('fs');
@@ -31,6 +34,7 @@ const CANDIDATES = [
 ].filter(Boolean);
 
 const OUT = path.join(ROOT, 'public', 'index.html');
+const LIVE = path.join(ROOT, 'public', 'live.js');
 const TAG_RE = /\s*<!--\s*fxhy-live\s*-->[\s\S]*?<!--\s*\/fxhy-live\s*-->\s*/g;
 
 function findSource() {
@@ -40,12 +44,52 @@ function findSource() {
   return null;
 }
 
+/** 相对工程根的展示路径，报错时让人一眼看出是哪个文件 */
+function rel(p) {
+  return path.relative(ROOT, p).replace(/\\/g, '/') || p;
+}
+
+/**
+ * 打印"仓库里到底缺什么"。
+ * Vercel 上代码来自 git 仓库，本地有的文件不等于云端有——
+ * 这个提示就是为此而写：直接点名要提交的文件，而不是只说"找不到"。
+ */
+function reportMissing() {
+  console.error('构建失败：找不到源页面（用于生成 public/index.html）。');
+  console.error('');
+  console.error('已尝试的路径：');
+  CANDIDATES.forEach((p) => console.error('  ' + p));
+  console.error('');
+  console.error('云端部署时，仓库里必须包含这两个文件（本地产物不会被自动带上）：');
+  console.error('  data/demo-source.html   约 1.0 MB，演示页源文件');
+  console.error('  public/live.js          约 60 KB，注入页面的接入层');
+  console.error('');
+  console.error('检查方法：在仓库首页看有没有 data 与 public 两个目录。');
+  console.error('补传后推送即会自动重新构建，无需改配置。');
+  console.error('');
+  console.error('本地开发也可用 DEMO_SRC 直接指向参赛作品原件：');
+  console.error('  DEMO_SRC="../2026-08-31-15-47-31/参赛作品/…/03_Demo演示页.html" npm run build');
+}
+
 function main() {
+  // live.js 是运行时依赖，缺了即使构建成功页面也是哑的，先查
+  if (!fs.existsSync(LIVE)) {
+    console.error('构建失败：缺少 ' + rel(LIVE));
+    console.error('该文件是前端接入层，必须随仓库提交（不是构建产物）。');
+    process.exit(1);
+  }
+
   const SRC = findSource();
+
   if (!SRC) {
-    console.error('找不到源页面。已尝试：');
-    CANDIDATES.forEach((p) => console.error('  ' + p));
-    console.error('\n请把 03_Demo演示页.html 复制到 data/demo-source.html，或用 DEMO_SRC 指定。');
+    // 已有产物时不让构建失败：常见于仓库里提交了 index.html、
+    // 或本地只改了别的文件想重新部署。硬失败会阻断整条部署链。
+    if (fs.existsSync(OUT)) {
+      console.warn('未找到源页面，沿用已有的 ' + rel(OUT));
+      console.warn('若要重新生成，请补上 data/demo-source.html 或设置 DEMO_SRC。');
+      return;
+    }
+    reportMissing();
     process.exit(1);
   }
 
@@ -56,7 +100,7 @@ function main() {
   html = html.replace(TAG_RE, '');
 
   if (!/<\/body>/i.test(html)) {
-    console.error('源页面缺少 </body>，无法注入。');
+    console.error('源页面缺少 </body>，无法注入：' + rel(SRC));
     process.exit(1);
   }
 
@@ -71,16 +115,9 @@ function main() {
   fs.mkdirSync(path.dirname(OUT), { recursive: true });
   fs.writeFileSync(OUT, html, 'utf8');
 
-  // 校验 live.js 存在
-  const livePath = path.join(ROOT, 'public', 'live.js');
-  if (!fs.existsSync(livePath)) {
-    console.error('缺少 public/live.js');
-    process.exit(1);
-  }
-
   console.log('构建完成');
   console.log('  源文件  ' + SRC);
-  console.log('  输出    ' + OUT);
+  console.log('  输出    ' + rel(OUT));
   console.log('  体积    ' + (originalSize / 1024 / 1024).toFixed(2) + ' MB → ' +
     (Buffer.byteLength(html) / 1024 / 1024).toFixed(2) + ' MB');
   console.log('  注入    <script src="live.js" defer>');

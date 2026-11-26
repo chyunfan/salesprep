@@ -33,6 +33,11 @@
     checks: null,
     facts: null,       // 当前使用的事实集
     factsName: '',
+    factsFor: null,    // 事实集归属的企业全称。A 企业的事实绝不能写进 B 企业的报告
+    sources: null,     // 采集时命中的来源，供人工核对
+    via: null,         // kuaicha（快查结构化数据）| web_search | search_endpoint
+    attribution: null, // 数据源署名，快查要求呈现时标注
+    sample: false,     // 当前报告是否基于内置样例
     lastError: null,
     mode: 'demo'       // demo | live
   };
@@ -63,6 +68,24 @@
   };
 
   const TASK_LABEL = { report: '企业画像报告', script: '营销话术' };
+
+  /** 样例企业全称：只有查询这一家时，才允许用内置样例 */
+  const SAMPLE_COMPANY = SAMPLE_FACTS.企业名称;
+
+  /** 归一化企业名：去空格、括号统一，用于判定"是不是样例企业" */
+  function normName(s) {
+    return String(s || '')
+      .replace(/\s+/g, '')
+      .replace(/[（]/g, '(')
+      .replace(/[）]/g, ')')
+      .toUpperCase();
+  }
+
+  function isSampleCompany(name) {
+    const n = normName(name);
+    if (!n) return false;
+    return n === normName(SAMPLE_COMPANY) || n.indexOf('明远智能装备') >= 0;
+  }
 
   /* ---------------------------------------------------------------- 工具 */
 
@@ -152,6 +175,80 @@
     return result;
   }
 
+  /* ---------------------------------------------------------------- 事实采集 */
+
+  /**
+   * 按企业全称联网采集公开信息。
+   * 这是"真实企业出真实报告"的唯一入口——采集失败就抛错，不拿样例顶上。
+   */
+  async function fetchFacts(company) {
+    const res = await fetch('/api/facts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company })
+    });
+    let j = {};
+    try {
+      j = await res.json();
+    } catch (_) {
+      /* 网关返回非 JSON（如超时页）时按状态码报错 */
+    }
+    if (!res.ok || !j.ok) {
+      const err = new Error(j.message || '检索公开信息失败（HTTP ' + res.status + '）');
+      err.code = j.error || 'FACTS_FAILED';
+      throw err;
+    }
+    return j;
+  }
+
+  /**
+   * 保证事实集与当前查询企业一致。
+   * 优先级：同名缓存/手工编辑过的事实 > 样例企业走内置样例 > 联网检索。
+   * 关键点：factsFor 记录事实归属，换企业必然重新采集，杜绝张三的名单写进李四的报告。
+   */
+  async function ensureFacts(company, onStage) {
+    const say = (m) => { if (typeof onStage === 'function') onStage(m); };
+
+    if (isSampleCompany(company)) {
+      STATE.facts = SAMPLE_FACTS;
+      STATE.factsFor = company;
+      STATE.sources = null;
+      STATE.via = null;
+      STATE.attribution = null;
+      STATE.sample = true;
+      STATE.factsName = '内置脱敏样例';
+      updateFactsName();
+      return { facts: SAMPLE_FACTS, sample: true, sources: [] };
+    }
+
+    if (STATE.factsFor === company && STATE.facts && Object.keys(STATE.facts).length) {
+      say('复用已采集的事实集');
+      return { facts: STATE.facts, sample: false, sources: STATE.sources || [] };
+    }
+
+    say('正在采集「' + company + '」的企业信息…');
+    const j = await fetchFacts(company);
+
+    STATE.facts = j.facts || {};
+    STATE.factsFor = company;
+    STATE.sources = j.sources || [];
+    STATE.via = j.via || null;
+    STATE.attribution = j.attribution || null;
+    STATE.sample = false;
+    STATE.factsName = sourceLabel(j);
+    updateFactsName();
+
+    say('已获取 ' + Object.keys(STATE.facts).length + ' 项事实');
+    return { facts: STATE.facts, sample: false, sources: STATE.sources, meta: j };
+  }
+
+  /** 事实源的中文口径：快查是结构化接口，联网检索是网页，两者不能混着说 */
+  function sourceLabel(j) {
+    if (j && j.via === 'kuaicha') return '快查企业数据';
+    const n = ((j && j.sources) || []).length;
+    return n ? '联网检索 ' + n + ' 个来源' : '联网检索';
+  }
+
   /* ---------------------------------------------------------------- 界面：状态徽标 */
 
   function paintBadge() {
@@ -191,8 +288,9 @@
       '<span class="fx-fb-k">事实源</span>' +
       '<span class="fx-fb-v" id="fxFactsName"></span>' +
       '<button class="fx-fb-btn" onclick="fxhyFacts()">查看 / 编辑</button>' +
+      '<button class="fx-fb-btn" onclick="fxhySources()">来源</button>' +
       '<button class="fx-fb-btn" onclick="fxhyBatch()">📋 批量清单</button>' +
-      '<span class="fx-fb-tip">模型只允许使用这里的信息；查不到的字段会写成占位符，不会编造</span>';
+      '<span class="fx-fb-tip">事实按查询企业实时采集；查不到的字段写成占位符，不编造</span>';
     row.parentNode.insertBefore(bar, row.nextSibling);
 
     // 话术面板也提示一句，避免两边事实不一致造成误解
@@ -235,6 +333,49 @@
     if (foot) foot.classList.remove('on');
   };
 
+  /** 把采集用到的公开网页摆出来，让客户经理能逐个点开核对 */
+  window.fxhySources = function () {
+    const src = STATE.sources || [];
+    const who = STATE.factsFor || '';
+    let body;
+
+    if (src.length && STATE.via === 'kuaicha') {
+      body =
+        '<p class="fx-hint">「' + esc(who) + '」的事实来自' + esc(STATE.attribution || '快查企业数据引擎') +
+        '，是结构化企业数据（工商登记、股东、实控人、涉诉均为字段），不是网页抓取，' +
+        '因此没有可逐个点开的原文页面。</p>' +
+        '<ul class="fx-src-list">' +
+        '<li><a href="https://www.kuaicha365.com" target="_blank" rel="noopener noreferrer">' +
+        esc(STATE.attribution || '快查企业数据引擎') + '</a><span>结构化企业数据接口</span></li>' +
+        '</ul>' +
+        '<p class="fx-hint">数据接口返回的是"登记口径"结论，登记状态、注册资本变更可能有滞后；' +
+        '涉及授信决策时，建议再核对营业执照与最新工商变更。</p>';
+    } else if (src.length) {
+      body =
+        '<p class="fx-hint">以下是本次为「' + esc(who) + '」采集事实时命中并引用的公开网页。' +
+        '注册资本、股东、涉诉这类关键数字，建议点开原文核对后再用于客户沟通。</p>' +
+        '<ul class="fx-src-list">' +
+        src
+          .map(
+            (s) =>
+              '<li><a href="' + esc(s.url) + '" target="_blank" rel="noopener noreferrer">' +
+              esc(s.title || s.url) + '</a><span>' + esc(s.url) + '</span></li>'
+          )
+          .join('') +
+        '</ul>';
+    } else if (isSampleCompany(who)) {
+      body =
+        '<p class="fx-hint">当前使用内置脱敏样例（' + esc(SAMPLE_COMPANY) + '），没有外部来源。' +
+        '换成真实企业全称后，系统会联网检索，并在这里列出可核对的网页。</p>';
+    } else {
+      body = '<p class="fx-hint">当前事实集来自手工填写或清单导入，没有外部网页来源。</p>';
+    }
+
+    openModal('事实来源', body);
+    const foot = $('modalFoot');
+    if (foot) foot.classList.remove('on');
+  };
+
   window.fxhyFactsReset = function () {
     const ta = $('fxFactsInput');
     if (ta) ta.value = JSON.stringify(SAMPLE_FACTS, null, 2);
@@ -253,6 +394,17 @@
     }
     STATE.facts = obj;
     STATE.factsName = '自定义事实集';
+    /*
+     * 手工改过的事实要绑定到当前输入的企业名上，否则下次生成又会被重新检索覆盖，
+     * 客户经理刚补的存款、授信数据就白填了。
+     */
+    const el = $('companyInput');
+    const cur = ((el && el.value) || '').trim();
+    if (cur) STATE.factsFor = cur;
+    STATE.sources = null;
+    STATE.via = 'manual';
+    STATE.attribution = null;
+    STATE.sample = false;
     updateFactsName();
     closeModal();
     toastSafe('事实已更新，共 ' + Object.keys(obj).length + ' 项');
@@ -296,13 +448,108 @@
     return '';
   }
 
-  /** 报告正文（弹窗与下载共用） */
-  function reportBodyHtml(rep) {
+  /**
+   * 银行内部业务字段。
+   * 这类数据只存在于行内系统（存款、贷款、代发、结算…），公开渠道永远查不到，
+   * 联网采集来的事实集里必然为空。所以不能让它占着正文的版面写一长串"未提供"。
+   */
+  const INNER_KEY_RE = /行内|银行内部|本行|存款|贷款|授信|代发|结算账户|结算量|开户|理财|票据|中间业务|综合贡献|信用评级|日均余额/;
+  /* 同样不能写 ^(|待补充) —— 空分支会让正则恒真，把有数值的行也折叠掉 */
+  const BLANK_VAL_RE = /^(?:—+|-+|–+|待补充|未提供|暂无|不详|未知|不适用|n\/?a$|待客户经理补充|需补充|需核实|无$|无[，,。；;])/i;
+
+  /** 判断某一行是不是"行内业务 + 空值"——是的话收进折叠区 */
+  function isInnerBlank(k, v) {
+    if (!INNER_KEY_RE.test(String(k || ''))) return false;
+    const s = String(v == null ? '' : v)
+      .replace(/🔴\s*待客户经理补充/g, '')
+      .replace(/\{\{[^}]*\}\}/g, '')
+      .trim();
+    if (!s) return true;
+    return BLANK_VAL_RE.test(s);
+  }
+
+  /** 折叠区：交互版默认收起，打印版展开成普通章节（归档件要完整） */
+  function innerFoldHtml(rows, expand) {
+    if (!rows.length) return '';
+    const table =
+      '<table class="fx-table fx-inner-table"><tbody>' +
+      rows
+        .map(
+          (r) =>
+            '<tr><td class="fx-k">' + rich(r.k || '') + '</td><td>' +
+            markUnverified(rich(String(r.v || '').replace(/🔴\s*待客户经理补充/g, '') || '待客户经理补充')) +
+            '</td></tr>'
+        )
+        .join('') +
+      '</tbody></table>';
+
+    if (expand) {
+      return (
+        '<section class="fx-chap fx-inner-section"><h4>银行内部业务数据（待补充）</h4>' + table + '</section>'
+      );
+    }
+    return (
+      '<details class="fx-inner-fold">' +
+      '<summary>银行内部业务数据 · ' + rows.length + ' 项待补充' +
+      '<span class="fx-inner-hint">点开填写，公开渠道无法获取</span></summary>' +
+      table +
+      '</details>'
+    );
+  }
+
+  /** 打印版的来源脚注：归档件必须能回溯到具体出处 */
+  function sourcesFooter() {
+    const list = STATE.sources || [];
+    if (!list.length) return '';
+
+    if (STATE.via === 'kuaicha') {
+      return (
+        '<div class="fx-sources"><b>数据来源</b>' +
+        '<div style="margin-top:4px">' + esc(STATE.attribution || '同花顺旗下快查企业数据引擎') +
+        '（结构化企业数据接口）</div>' +
+        '<div class="fx-src-note">以上字段取自工商登记与公开企业数据，口径为登记值。' +
+        '登记状态、注册资本变更可能存在滞后，授信决策前请复核营业执照与最新工商变更；' +
+        '接口未覆盖的字段已在正文以占位符标出。</div></div>'
+      );
+    }
+
+    return (
+      '<div class="fx-sources"><b>公开信息来源</b><ol>' +
+      list
+        .map((s) => '<li>' + esc(s.title || '来源') + ' — ' + esc(s.url || '') + '</li>')
+        .join('') +
+      '</ol><div class="fx-src-note">以上为联网检索命中的公开网页。涉及注册资本、股东、涉诉等关键数字，' +
+      '请点开原文核对后再用于客户沟通；检索结果不保证完整，缺失项已在正文以占位符标出。</div></div>'
+    );
+  }
+
+  /** 报告正文（弹窗与下载共用）；opts.expandInner 为 true 时行内数据不折叠 */
+  function reportBodyHtml(rep, opts) {
     if (!rep) return '<p class="fx-p">暂无数据</p>';
-    const chapters = (rep.chapters || []).map((c) =>
-      '<section class="fx-chap"><h4>' + rich((c.no ? c.no + '、' : '') + (c.title || '')) + '</h4>' +
-      (c.blocks || []).map(blockHtml).join('') + '</section>'
-    ).join('');
+    const o = opts || {};
+    const innerRows = [];
+
+    const chapters = (rep.chapters || [])
+      .map((c) => {
+        const body = (c.blocks || [])
+          .map((b) => {
+            if (!b || b.type !== 'kv' || !Array.isArray(b.rows)) return blockHtml(b);
+
+            const kept = [];
+            for (const r of b.rows) {
+              if (isInnerBlank(r && r.k, r && r.v)) innerRows.push(r);
+              else kept.push(r);
+            }
+            if (!kept.length) return '';
+            return blockHtml(Object.assign({}, b, { rows: kept }));
+          })
+          .join('');
+        if (!body.trim()) return '';
+        return '<section class="fx-chap"><h4>' + rich((c.no ? c.no + '、' : '') + (c.title || '')) + '</h4>' + body + '</section>';
+      })
+      .join('');
+
+    const inner = innerFoldHtml(innerRows, Boolean(o.expandInner));
 
     const mp = (rep.marketing_points || []).length
       ? '<div class="fx-side"><b>可营销点</b><ul>' + rep.marketing_points.map((t) => '<li>' + markUnverified(rich(t)) + '</li>').join('') + '</ul></div>' : '';
@@ -317,6 +564,7 @@
       '<div class="fx-rep-sum">' + rich(rep.summary || '') + '</div></div>' +
       chapters +
       (mp || rk || gp ? '<div class="fx-sides">' + mp + rk + gp + '</div>' : '') +
+      inner +
       checkStrip() +
       '</div>'
     );
@@ -368,6 +616,11 @@
       '.fx-sides{margin-top:14px;page-break-inside:avoid}' +
       '.fx-side{border:1px solid #d8e0e8;border-radius:6px;padding:9px 12px;margin:8px 0}' +
       '.fx-side b{display:block;font-size:10.5pt;margin-bottom:4px;color:#0F2E4A}' +
+      '.fx-sources{margin-top:14px;padding:9px 12px;border-top:1px solid #d8e0e8;font-size:9pt;color:#44586a}' +
+      '.fx-sources ol{margin:4px 0 0 16px;padding:0;line-height:1.7;word-break:break-all}' +
+      '.fx-src-note{margin-top:6px;color:#8494a3;font-size:8.5pt;line-height:1.6}' +
+      '.fx-inner-section{margin-top:10px}' +
+      'details.fx-inner-fold{display:block}' +
       '.fx-side-warn{border-color:#f0c2c2;background:#fff7f7}' +
       '.fx-side-gap{border-color:#f3dca8;background:#fffdf5}' +
       '.fx-unv-mark{background:#fff1f1;color:#c62828;border-bottom:1pt wavy #e57373;padding:0 2px;font-weight:700}' +
@@ -385,9 +638,11 @@
       '</style></head><body>' +
       '<h1>对公客户访前画像报告</h1>' +
       '<div class="sub">' + esc((rep && rep.company) || '') + ' · AI 生成内容，须经人工复核后方可使用</div>' +
-      reportBodyHtml(rep) +
-      '<div class="foot">本文档由营销助手基于调用方提供的事实集生成。模型不参与事实采集，' +
-      '所有数字均可在事实源中查得；标注"待客户经理补充"的字段为公开渠道未获取项，请现场核实后填写。</div>' +
+      reportBodyHtml(rep, { expandInner: true }) +
+      sourcesFooter() +
+      '<div class="foot">本文档基于查询企业全称联网检索到的公开信息生成，每项数据均可在信息来源中回溯核对；' +
+      '银行内部业务数据公开渠道无法获取，统一列在「银行内部业务数据（待补充）」一节，请现场核实后填写。' +
+      'AI 生成内容，须经人工复核后方可使用。</div>' +
       '</body></html>';
   }
 
@@ -406,12 +661,17 @@
     if (STATE.busy) return;
 
     const nameEl = $('companyInput');
-    const name = ((nameEl && nameEl.value) || '').trim() || '杭州明远智能装备有限公司';
+    const name = ((nameEl && nameEl.value) || '').trim();
+    if (!name) {
+      toastSafe('请先输入要查询的企业全称');
+      if (nameEl) nameEl.focus();
+      return;
+    }
 
     if (!STATE.ready) {
-      STATE.lastError = '未连接大模型，已回退演示样例';
-      toastSafe('当前未配置大模型，展示的是内置样例；在 .env 中填入 KIMI_API_KEY 后即可真实生成');
-      return legacy('startReport');
+      STATE.lastError = '未连接大模型';
+      toastSafe('未连接大模型：当前无法生成真实报告。请配置环境变量 KIMI_API_KEY 后刷新页面。');
+      return;
     }
 
     STATE.busy = true;
@@ -424,11 +684,25 @@
     if (typeof renderPipeline === 'function') renderPipeline();
 
     try {
-      /* A · 事实准备（真实：把事实集装配成请求体） */
-      setPipe(0, '执行中…', 'active');
-      await sleep(420);
-      const facts = STATE.facts || SAMPLE_FACTS;
-      setPipe(0, '✓ 完成 · ' + Object.keys(facts).length + ' 项', 'done');
+      /*
+       * A · 事实准备
+       * 这是本次改造的核心：企业名决定事实集。
+       * 样例企业走内置样例，其余一律联网检索；检索不到就中止，绝不用样例冒充。
+       */
+      setPipe(0, '准备事实…', 'active');
+      let pack;
+      try {
+        pack = await ensureFacts(name, (msg) => setPipe(0, msg, 'active'));
+      } catch (err) {
+        setPipe(0, '✗ 未取得事实', 'active');
+        throw err;
+      }
+      const facts = pack.facts;
+      setPipe(
+        0,
+        '✓ ' + (pack.sample ? '内置样例' : '联网检索') + ' · ' + Object.keys(facts).length + ' 项',
+        'done'
+      );
 
       /* B · 模型生成（真实耗时，流式回传字数） */
       setPipe(1, '模型生成中…', 'active');
@@ -452,6 +726,12 @@
 
       STATE.report = result.data;
       STATE.checks = result.checks;
+      /*
+       * 标题与文件名一律以查询名为准。
+       * 模型偶有把全称写成简称、或补上"有限公司"的，报告是要归档到具体客户名下的，
+       * 抬头不能跟着模型走；否则又会出现"查 A 企业、成品写 B 企业"。
+       */
+      if (STATE.report) STATE.report.company = name;
       const sec = Math.round((Date.now() - t0) / 100) / 10;
       setPipe(1, '✓ 完成 · ' + sec + 's', 'done');
 
@@ -508,9 +788,25 @@
     } catch (err) {
       console.error('[fxhy] report failed', err);
       STATE.lastError = err.message;
-      toastSafe('生成失败：' + err.message + '（已回退到演示样例）');
+      /*
+       * 不回退样例。这是本次改造的红线：
+       * 把"杭州明远智能装备"的股东、人数、产品当成真实客户的资料交付，
+       * 比交不出报告危险得多——客户经理会照着这份东西去见客户。
+       */
+      const advice =
+        err.code === 'SEARCH_NO_SOURCE' || err.code === 'SEARCH_EMPTY'
+          ? '未获取到可引用的公开信息：请核对全称是否与工商登记一致，或改用「批量清单」上传该企业的材料。'
+          : err.code === 'KUAICHA_NOT_FOUND'
+            ? '快查未收录该主体：请核对工商登记全称（可用统一社会信用代码），或改用「批量清单」上传材料。'
+            : err.code === 'KUAICHA_AUTH'
+              ? '快查鉴权失败：请在服务端核对 KUAICHA_API_KEY 与 KUAICHA_AUTH_HEADER。'
+              : err.code === 'NO_API_KEY'
+                ? '服务端未配置数据源（KUAICHA_API_KEY 或 KIMI_API_KEY），无法采集企业信息与生成内容。'
+                : '';
+      setPipe(1, '✗ 已中止', 'active');
+      if (dv) dv.classList.remove('show');
       if (typeof resetReport === 'function') resetReport();
-      return legacy('startReport');
+      toastSafe('生成失败：' + err.message + (advice ? '｜' + advice : ''));
     } finally {
       STATE.busy = false;
       if (btn) btn.disabled = false;
@@ -601,12 +897,17 @@
     if (STATE.busy) return;
 
     const el = $('scriptCompany');
-    const name = ((el && el.value) || '').trim() || '杭州明远智能装备有限公司';
+    const name = ((el && el.value) || '').trim();
+    if (!name) {
+      toastSafe('请先输入要查询的企业全称');
+      if (el) el.focus();
+      return;
+    }
 
     if (!STATE.ready) {
-      STATE.lastError = '未连接大模型，已回退演示样例';
-      toastSafe('当前未配置大模型，展示的是内置样例');
-      return legacy('genScript');
+      STATE.lastError = '未连接大模型';
+      toastSafe('未连接大模型：当前无法生成真实话术。请配置环境变量 KIMI_API_KEY 后刷新页面。');
+      return;
     }
 
     STATE.busy = true;
@@ -616,13 +917,19 @@
     if (area) {
       area.innerHTML =
         '<div class="script-card"><div class="script-body">' +
-        '<p id="fxScriptStatus" style="font-size:13.5px;color:#64748b">正在读取事实集，生成五场景话术…</p>' +
+        '<p id="fxScriptStatus" style="font-size:13.5px;color:#64748b">正在取得该企业的事实集…</p>' +
         '</div></div>';
     }
 
     try {
+      /* 与报告共用一条事实链：同样按企业名取事实，换企业必然重新采集 */
+      const pack = await ensureFacts(name, (msg) => {
+        const s = $('fxScriptStatus');
+        if (s) s.textContent = msg;
+      });
+
       const result = await callStream(
-        { task: 'script', company: name, facts: STATE.facts || SAMPLE_FACTS },
+        { task: 'script', company: name, facts: pack.facts },
         {
           onDelta: (d) => {
             const s = $('fxScriptStatus');
@@ -678,8 +985,20 @@
     } catch (err) {
       console.error('[fxhy] script failed', err);
       STATE.lastError = err.message;
-      toastSafe('生成失败：' + err.message + '（已回退到演示样例）');
-      return legacy('genScript');
+      /* 与报告一致：失败就如实报错，不把样例话术当成该客户的产出 */
+      const advice =
+        err.code === 'SEARCH_NO_SOURCE' || err.code === 'SEARCH_EMPTY'
+          ? '未检索到可引用的公开信息，请核对全称或用「批量清单」上传该企业材料。'
+          : '';
+      if (area) {
+        area.innerHTML =
+          '<div class="script-card"><div class="script-body">' +
+          '<p style="font-size:13.5px;color:#b42318;font-weight:600">话术生成失败</p>' +
+          '<p style="font-size:13px;color:#475569;line-height:1.75">' + esc(err.message) +
+          (advice ? '<br>' + esc(advice) : '') + '</p>' +
+          '</div></div>';
+      }
+      toastSafe('生成失败：' + err.message + (advice ? '｜' + advice : ''));
     } finally {
       STATE.busy = false;
     }
@@ -739,6 +1058,25 @@
 .fx-todo{color:#c62828;font-weight:700;background:#fff5f5;padding:0 4px;border-radius:3px}
 code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;font-size:12px}
 .fx-sides{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:16px}
+.fx-inner-fold{margin-top:16px;border:1px solid #e2e9f0;border-radius:9px;background:#fbfdff;overflow:hidden}
+.fx-inner-fold>summary{cursor:pointer;padding:10px 13px;font-size:12.5px;font-weight:700;color:#44586a;
+  list-style:none;display:flex;align-items:center;gap:8px}
+.fx-inner-fold>summary::-webkit-details-marker{display:none}
+.fx-inner-fold>summary:before{content:"▸";color:#93a5b8;font-size:11px;transition:transform .15s}
+.fx-inner-fold[open]>summary:before{transform:rotate(90deg)}
+.fx-inner-fold>summary:hover{background:#f1f6fb}
+.fx-inner-hint{margin-left:auto;font-weight:400;font-size:11.5px;color:#93a5b8}
+.fx-inner-table{margin:0}
+.fx-inner-table td{border-left:0;border-right:0;border-bottom:1px solid #eef3f8}
+.fx-inner-table tr:last-child td{border-bottom:0}
+.fx-sources{margin-top:18px;padding:12px 14px;border-radius:9px;background:#f6f9fc;font-size:12px;color:#44586a}
+.fx-sources ol{margin:6px 0 0 18px;padding:0;line-height:1.8;word-break:break-all}
+.fx-src-note{margin-top:8px;color:#8494a3;font-size:11.5px;line-height:1.6}
+.fx-src-list{margin:8px 0 0;padding:0;list-style:none;max-height:52vh;overflow:auto}
+.fx-src-list li{padding:9px 11px;border:1px solid #e2e9f0;border-radius:8px;margin-bottom:8px;background:#fbfdff}
+.fx-src-list a{font-size:12.5px;color:#1d4ed8;text-decoration:none;font-weight:600;display:block;line-height:1.5}
+.fx-src-list a:hover{text-decoration:underline}
+.fx-src-list span{display:block;font-size:11px;color:#93a5b8;margin-top:3px;word-break:break-all}
 .fx-side{border:1px solid #e2e9f0;border-radius:9px;padding:10px 12px;background:#fbfdff}
 .fx-side b{display:block;font-size:12.5px;color:#0F2E4A;margin-bottom:5px}
 .fx-side ul{margin:0 0 0 16px;padding:0;font-size:12.5px;line-height:1.7}
@@ -1269,7 +1607,7 @@ code.fx-ph{background:#fff4e0;color:#8a5a00;padding:1px 4px;border-radius:3px;fo
         return (
           '<section class="fxb-item">' +
           '<div class="fxb-item-no">第 ' + (n + 1) + ' 户 / 共 ' + items.length + ' 户</div>' +
-          reportBodyHtml(rep) +
+          reportBodyHtml(rep, { expandInner: true }) +
           '</section>'
         );
       })

@@ -10,6 +10,9 @@
     "api/batch.js": {
       "maxDuration": 300
     },
+    "api/facts.js": {
+      "maxDuration": 300
+    },
     "api/parse.js": {
       "maxDuration": 60
     }

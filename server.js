@@ -131,7 +131,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/health') {
     return sendJson(res, 200, {
       ok: true,
-      service: 'fxhy-live',
+      service: 'salesprep',
       ...publicStatus(),
       time: new Date().toISOString()
     });
@@ -198,6 +198,23 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { ok: false, error: 'BAD_BODY', message: e.message });
     }
     const r = parseUpload(body);
+    return sendJson(res, r.status, r.json);
+  }
+
+  /* 采集企业公开信息：与 Vercel 上的 api/facts.js 同源，逻辑都在 lib/facts-api.js。
+     数据源由环境变量决定：配了 KUAICHA_API_KEY 走快查，否则走联网检索。 */
+  if (pathname === '/api/facts') {
+    if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'METHOD_NOT_ALLOWED' });
+
+    let body;
+    try {
+      body = await readBody(req, 1024 * 1024);
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: 'BAD_BODY', message: e.message });
+    }
+
+    const { handleFacts } = require('./lib/facts-api');
+    const r = await handleFacts(body, clientIp(req));
     return sendJson(res, r.status, r.json);
   }
 

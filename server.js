@@ -129,12 +129,22 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   if (pathname === '/api/health') {
-    return sendJson(res, 200, {
+    const payload = {
       ok: true,
       service: 'salesprep',
       ...publicStatus(),
       time: new Date().toISOString()
-    });
+    };
+    // 与线上同口径的自检入口，见 api/health.js
+    if (url.searchParams.get('probe') === '1') {
+      try {
+        const { probe } = require('./lib/kuaicha');
+        payload.probe = await probe(url.searchParams.get('company') || '');
+      } catch (e) {
+        payload.probe = { ok: false, error: `${e.code || ''} ${e.message}`.trim() };
+      }
+    }
+    return sendJson(res, 200, payload);
   }
 
   if (pathname === '/api/llm') {
